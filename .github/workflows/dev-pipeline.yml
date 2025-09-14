@@ -200,7 +200,7 @@ jobs:
           kubectl set image -n "$NAMESPACE" deploy/order-service-w08e1   order-service-container=$ACR_SERVER/order_service:dev-latest
 
           kubectl rollout status -n "$NAMESPACE" deploy/product-service-w08e1 --timeout=180s
-          kubectl rollout status -n "$NAMESPACE" deploy/order-service-w08e1   --timeout=180
+          kubectl rollout status -n "$NAMESPACE" deploy/order-service-w08e1 --timeout=180s
 
       # Wait until the services get LoadBalancer addresses
       - name: Discover backend addresses (LB IP or hostname)
