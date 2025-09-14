@@ -84,6 +84,8 @@ jobs:
         run: |
           kubectl apply -n "$NAMESPACE" -f k8s/configmaps.yaml
           kubectl apply -n "$NAMESPACE" -f k8s/secrets.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/product-db.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/order-db.yaml
           kubectl apply -n "$NAMESPACE" -f k8s/product-service.yaml
           kubectl apply -n "$NAMESPACE" -f k8s/order-service.yaml
 

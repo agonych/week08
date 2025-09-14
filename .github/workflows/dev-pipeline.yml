@@ -186,8 +186,10 @@ jobs:
       # Apply backend manifests to dev namespace
       - name: Apply backend manifests (DEV)
         run: |
-          kubectl apply -n "$NAMESPACE" -f k8s/configmaps.yaml
-          kubectl apply -n "$NAMESPACE" -f k8s/secrets.dev.yaml || true
+          kubectl apply -n "$NAMESPACE" -f k8s/configmaps.dev.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/secrets.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/product-db.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/order-db.yaml
           kubectl apply -n "$NAMESPACE" -f k8s/product-service.yaml
           kubectl apply -n "$NAMESPACE" -f k8s/order-service.yaml
 
