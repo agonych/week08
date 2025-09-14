@@ -1,0 +1,177 @@
+# Manual GitHub Action to deploy Production
+# - Deploy backend with a selected image tag
+# - Wait for LoadBalancer addresses
+# - Inject addresses into frontend code, rebuild/push frontend image
+# - Deploy frontend
+name: Prod Deploy - Backend then Frontend
+
+# Run only when triggered manually
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Backend image tag to deploy'
+        required: true
+        default: latest
+      namespace:
+        description: 'Target Kubernetes namespace for PROD'
+        required: true
+        default: prod
+
+# Required for OIDC
+permissions:
+  id-token: write
+  contents: read
+
+# Common environment variables
+env:
+  # ACR Name
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  # ACR Login server URL (e.g. somereg.azurecr.io)
+  ACR_SERVER: ${{ secrets.ACR_NAME }}.azurecr.io
+  # Azure credentials
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  # AKS details
+  AKS_RG: ${{ secrets.AKS_RG }}
+  AKS_NAME: ${{ secrets.AKS_NAME }}
+  # Inputs from the workflow_dispatch event
+  IMAGE_TAG: ${{ inputs.image_tag }}
+  NAMESPACE: ${{ inputs.namespace }}
+
+# Define the jobs in this workflow
+jobs:
+  # Job 1: Deploy backend services to PROD, wait for addresses
+  deploy_backend:
+    # Use the "Production" environment in GitHub for visibility and protection
+    environment: Production
+    runs-on: ubuntu-latest
+
+    # Capture discovered backend addresses as job outputs for the next job
+    outputs:
+      product_addr: ${{ steps.discover.outputs.product }}
+      order_addr:   ${{ steps.discover.outputs.order }}
+
+    # Define the steps of the job
+    steps:
+      # Checkout repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Login to Azure using OIDC (no long-lived secrets)
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      # Set kubectl context to the PROD cluster
+      - name: Set AKS context (PROD)
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name: ${{ env.AKS_NAME }}
+
+      # Make sure the PROD namespace exists
+      - name: Ensure namespace exists
+        run: |
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+      # Apply backend manifests (do not edit app code or manifests; keep as-is)
+      - name: Apply backend manifests
+        run: |
+          kubectl apply -n "$NAMESPACE" -f k8s/configmaps.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/secrets.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/product-service.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/order-service.yaml
+
+      # Point deployments to the selected backend image tag and wait for rollouts
+      - name: Set backend images to selected tag
+        run: |
+          kubectl set image -n "$NAMESPACE" deploy/product-service-w08e1 product-service-container=$ACR_SERVER/product_service:$IMAGE_TAG
+          kubectl set image -n "$NAMESPACE" deploy/order-service-w08e1   order-service-container=$ACR_SERVER/order_service:$IMAGE_TAG
+      
+          kubectl rollout status -n "$NAMESPACE" deploy/product-service-w08e1 --timeout=180s
+          kubectl rollout status -n "$NAMESPACE" deploy/order-service-w08e1   --timeout=180s
+
+      # Wait for LoadBalancer IPs/hostnames to appear and capture them as job outputs
+      - name: Discover backend addresses (LB IP or hostname)
+        id: discover
+        run: |
+          echo "Waiting for Product, Order LoadBalancer IPs to be assigned (up to 5 minutes)..."
+          PRODUCT_IP=""
+          ORDER_IP=""
+      
+          for i in $(seq 1 60); do
+            echo "Attempt $i/60 to get IPs..."
+            PRODUCT_IP=$(kubectl get service product-service-w08e1 -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            ORDER_IP=$(kubectl get service order-service-w08e1  -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            
+            if [[ -n "$PRODUCT_IP" && -n "$ORDER_IP" ]]; then
+              echo "All backend LoadBalancer IPs assigned!"
+              echo "Product Service IP: $PRODUCT_IP"
+              echo "Order Service IP: $ORDER_IP"
+              break
+            fi
+            sleep 5
+          done
+      
+          if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" ]]; then
+            echo "Error: One or more LoadBalancer IPs not assigned after timeout."
+            exit 1
+          fi
+      
+          # Expose for later steps/jobs
+          echo "product=$PRODUCT_IP" >> "$GITHUB_OUTPUT"
+          echo "order=$ORDER_IP"     >> "$GITHUB_OUTPUT"
+
+  # Job 2: Rebuild/push frontend with discovered backend addresses, deploy to PROD
+  build_and_deploy_frontend:
+    environment: Production
+    runs-on: ubuntu-latest
+    needs: deploy_backend
+
+    # Define the steps of the job
+    steps:
+      # Checkout repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Azure login (OIDC) for ACR access
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      # ACR login using the Azure session
+      - name: ACR login
+        run: az acr login --name $ACR_NAME
+
+      # Rebuild frontend with discovered backend addresses
+      - name: Rebuild frontend with discovered addresses and push
+        run: |
+          echo "Injecting IPs into frontend/main.js"
+          sed -i "s|_PRODUCT_API_URL_|http://${{ needs.deploy_backend.outputs.product_addr }}:8000|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|http://${{ needs.deploy_backend.outputs.order_addr }}:8001|g" frontend/main.js
+
+          echo "Building and pushing frontend image"
+          docker build -t $ACR_SERVER/frontend:$IMAGE_TAG ./frontend/
+          docker push $ACR_SERVER/frontend:$IMAGE_TAG
+
+      # Set kubectl context and deploy the rebuilt frontend to PROD
+      - name: Set AKS context (PROD)
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name: ${{ env.AKS_NAME }}
+
+      # Deploy frontend image
+      - name: Deploy frontend
+        run: |
+          kubectl apply -n "$NAMESPACE" -f k8s/frontend.yaml
+          kubectl set image -n "$NAMESPACE" deploy/frontend frontend-container=$ACR_SERVER/frontend:$IMAGE_TAG
+          kubectl rollout status -n "$NAMESPACE" deploy/frontend --timeout=180s

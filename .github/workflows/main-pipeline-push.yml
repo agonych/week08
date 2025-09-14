@@ -1,0 +1,66 @@
+# Prod GitHub Action workflow to run when code is merged into main
+# Builds and pushes backend production images
+name: Main Pipeline - Build and Publish Backend Prod Candidates
+
+# Define when to trigger this workflow
+on:
+  # Trigger this workflow when code is pushed to the main branch
+  push:
+    branches: [ main ]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/**'
+
+# Required for OIDC
+permissions:
+  id-token: write
+  contents: read
+
+# Define environment variables for the workflow
+env:
+  # ACR Name
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  # ACR Login server URL (e.g. somereg.azurecr.io)
+  ACR_SERVER: ${{ secrets.ACR_NAME }}.azurecr.io
+  # Azure credentials
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  # Image tag based on commit SHA for traceability
+  IMAGE_TAG: ${{ github.sha }}
+# Define the jobs in this workflow
+jobs:
+  # Job 1: Build and push backend production images to ACR
+  build_and_push_backend:
+    runs-on: ubuntu-latest
+
+    # Define the steps of the job
+    steps:
+      # Checkout repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Login to Azure using OIDC (short-lived credentials)
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      # Login to Azure Container Registry
+      - name: ACR login
+        run: az acr login --name "$ACR_NAME"
+
+      # Build and push backend production images
+      - name: Build & push backend production images
+        run: |
+          docker build -t $ACR_SERVER/product_service:$IMAGE_TAG backend/product_service
+          docker push $ACR_SERVER/product_service:$IMAGE_TAG
+          docker tag  $ACR_SERVER/product_service:$IMAGE_TAG $ACR_SERVER/product_service:latest
+          docker push $ACR_SERVER/product_service:latest
+
+          docker build -t $ACR_SERVER/order_service:$IMAGE_TAG backend/order_service
+          docker push $ACR_SERVER/order_service:$IMAGE_TAG
+          docker tag  $ACR_SERVER/order_service:$IMAGE_TAG $ACR_SERVER/order_service:latest
+          docker push $ACR_SERVER/order_service:latest

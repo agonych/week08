@@ -1,0 +1,253 @@
+# Dev GitHub Action workflow to test, build, and deploy both backend and
+# frontend components to AKS cluster with development namespace.
+# Triggered automatically on pushes to the 'dev' branch
+name: Dev Pipeline - Test, Build, Deploy Backend and Frontend
+
+# Define when to trigger this workflow
+on:
+  # Trigger this workflow when code is pushed to the dev branch
+  push:
+    branches: [ dev ]
+    paths:
+      # Run only if files in these paths are changed
+      - 'backend/**'
+      - 'frontend/**'
+      - '.github/workflows/**'
+
+# Required for OIDC
+permissions:
+  id-token: write
+  contents: read
+
+# Define environment variables for the workflow
+env:
+  # ACR Name
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  # ACR Login server URL (e.g. somereg.azurecr.io)
+  ACR_SERVER: ${{ secrets.ACR_NAME }}.azurecr.io
+  # Azure credentials
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  # AKS details
+  AKS_RG: ${{ secrets.AKS_RG }}
+  AKS_NAME: ${{ secrets.AKS_NAME }}
+  # Image tag will be based on commit SHA for traceability
+  IMAGE_TAG: ${{ github.sha }}
+  # Kubernetes namespace for development
+  NAMESPACE: dev
+
+# Define the jobs in this workflow
+jobs:
+  # Job 1: Run backend tests
+  test_and_lint_backends:
+    runs-on: ubuntu-latest # Use a GitHub-hosted runner
+
+    services:
+      # Product DB container
+      product_db:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: products
+        # Make pg_isready available so the service is healthy before tests run
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      # Order DB
+      order_db:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: orders
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      # Checkout the repository code to the runner
+      - name: Checkout repository
+        uses: actions/checkout@v4 # Action to check out your repository code
+
+      # Set up Python environment
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5 # Action to set up Python environment
+        with:
+          python-version: '3.10'
+
+      # Install dependencies and run code quality checks
+      - name: Install dependencies
+        run: | # Use a multi-line script to install pip dependencies
+          pip install --upgrade pip
+          # Loop through each backend service folder
+          for req in backend/*/requirements.txt; do
+            echo "Installing $req"
+            pip install -r "$req"
+          done
+          # Install CI tools
+          pip install pytest httpx
+
+      # Run tests for product service
+      - name: Run product_service tests
+        working-directory: backend/product_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          POSTGRES_DB: products
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: |
+          pytest tests --maxfail=1 --disable-warnings -q
+
+      # Run tests for order service
+      - name: Run order_service tests
+        working-directory: backend/order_service
+        env:
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5433
+          POSTGRES_DB: orders
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        run: |
+          pytest tests --maxfail=1 --disable-warnings -q
+
+  # Job 2: build and push backend images if tests succeed
+  build_and_push_backend:
+    runs-on: ubuntu-latest
+    needs: test_and_lint_backends
+    # Define the steps to run in this job
+    steps:
+      - uses: actions/checkout@v4
+
+      # Login to Azure using short-lived OIDC tokens
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      # Login to the container registry
+      - name: ACR login
+        run: az acr login --name "$ACR_NAME"
+
+      # Build and push both backend service images, tagged with both commit SHA
+      - name: Build & push backend images
+        run: |
+          docker build -t $ACR_SERVER/product_service:$IMAGE_TAG backend/product_service
+          docker tag  $ACR_SERVER/product_service:$IMAGE_TAG $ACR_SERVER/product_service:dev-latest
+          docker push $ACR_SERVER/product_service:$IMAGE_TAG
+          docker push $ACR_SERVER/product_service:dev-latest
+
+          docker build -t $ACR_SERVER/order_service:$IMAGE_TAG backend/order_service
+          docker tag  $ACR_SERVER/order_service:$IMAGE_TAG $ACR_SERVER/order_service:dev-latest
+          docker push $ACR_SERVER/order_service:$IMAGE_TAG
+          docker push $ACR_SERVER/order_service:dev-latest
+
+  # Job 3: deploy backend, discover IPs, rebuild frontend with IPs, deploy frontend
+  deploy_backend_and_frontend:
+    runs-on: ubuntu-latest
+    needs: build_and_push_backend
+    # Define the steps to run in this job
+    steps:
+        # Get the repository code
+      - uses: actions/checkout@v4
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      # Connect kubectl to the dev AKS cluster
+      - name: Set AKS context (DEV)
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name:  ${{ env.AKS_NAME }}
+
+      # Make sure namespace exists for dev
+      - name: Ensure namespace exists
+        run: |
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+      # Apply backend manifests to dev namespace
+      - name: Apply backend manifests (DEV)
+        run: |
+          kubectl apply -n "$NAMESPACE" -f k8s/configmaps.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/secrets.dev.yaml || true
+          kubectl apply -n "$NAMESPACE" -f k8s/product-service.yaml
+          kubectl apply -n "$NAMESPACE" -f k8s/order-service.yaml
+
+      # Set backend deployments to use the freshly built images
+      - name: Pin backend images for this commit
+        run: |
+          kubectl set image -n "$NAMESPACE" deploy/product-service-w08e1 product-service-container=$ACR_SERVER/product_service:dev-latest
+          kubectl set image -n "$NAMESPACE" deploy/order-service-w08e1   order-service-container=$ACR_SERVER/order_service:dev-latest
+
+          kubectl rollout status -n "$NAMESPACE" deploy/product-service-w08e1 --timeout=180s
+          kubectl rollout status -n "$NAMESPACE" deploy/order-service-w08e1   --timeout=180
+
+      # Wait until the services get LoadBalancer addresses
+      - name: Discover backend addresses (LB IP or hostname)
+        id: addrs
+        run: |
+          echo "Waiting for Product, Order LoadBalancer IPs to be assigned (up to 5 minutes)..."
+          PRODUCT_IP=""
+          ORDER_IP=""
+          
+          for i in $(seq 1 60); do
+            echo "Attempt $i/60 to get IPs..."
+            PRODUCT_IP=$(kubectl get service product-service-w08e1 -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            ORDER_IP=$(kubectl get service order-service-w08e1 -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+            if [[ -n "$PRODUCT_IP" && -n "$ORDER_IP" ]]; then
+              echo "All backend LoadBalancer IPs assigned!"
+              echo "Product Service IP: $PRODUCT_IP"
+              echo "Order Service IP: $ORDER_IP"
+              break
+            fi
+            sleep 5 # Wait 5 seconds before next attempt
+          done
+          
+          if [[ -z "$PRODUCT_IP" || -z "$ORDER_IP" ]]; then
+            echo "Error: One or more LoadBalancer IPs not assigned after timeout."
+            exit 1 # Fail the job if IPs are not obtained
+          fi
+          
+          # Set as step outputs for later steps in this job
+          echo "product=$PRODUCT_IP" >> $GITHUB_OUTPUT
+          echo "order=$ORDER_IP"     >> $GITHUB_OUTPUT
+
+      # Rebuild frontend with discovered backend addresses
+      - name: Rebuild frontend with discovered addresses and push
+        run: |
+          echo "Injecting IPs into frontend/static/js/main.js"
+          # Ensure frontend/main.js is directly in the path for sed
+          sed -i "s|_PRODUCT_API_URL_|http://${{ steps.addrs.outputs.product }}:8000|g" frontend/main.js
+          sed -i "s|_ORDER_API_URL_|http://${{ steps.addrs.outputs.order }}:8001|g" frontend/main.js
+          
+          echo "Building and pushing frontend image"
+          docker build -t $ACR_SERVER/frontend:$IMAGE_TAG ./frontend/
+          docker tag  $ACR_SERVER/frontend:$IMAGE_TAG $ACR_SERVER/frontend:dev-latest
+          docker push $ACR_SERVER/frontend:$IMAGE_TAG
+          docker push $ACR_SERVER/frontend:dev-latest
+
+      # Deploy the rebuilt frontend to dev namespace
+      - name: Deploy frontend (DEV)
+        run: |
+          kubectl apply -n "$NAMESPACE" -f k8s/frontend.yaml
+          kubectl set image -n "$NAMESPACE" deploy/frontend frontend-container=$ACR_SERVER/frontend:dev-latest
+          kubectl rollout status -n "$NAMESPACE" deploy/frontend --timeout=180s
