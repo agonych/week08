@@ -233,6 +233,10 @@ jobs:
           echo "product=$PRODUCT_IP" >> $GITHUB_OUTPUT
           echo "order=$ORDER_IP"     >> $GITHUB_OUTPUT
 
+      # ACR login using the Azure session
+      - name: ACR login
+        run: az acr login --name "$ACR_NAME"
+
       # Rebuild frontend with discovered backend addresses
       - name: Rebuild frontend with discovered addresses and push
         run: |
